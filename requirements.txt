@@ -1,0 +1,10 @@
+Flask
+flask_cors
+Gunicorn
+numpy
+matplotlib
+pillow
+google-cloud-vision
+requests
+japanize_matplotlib
+opencv-python-headless

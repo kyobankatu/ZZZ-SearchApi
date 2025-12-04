@@ -1,10 +1,6 @@
 Flask
 flask_cors
 Gunicorn
-numpy
-matplotlib
-pillow
-google-cloud-vision
-opencv-python-headless
 requests
-japanize_matplotlib
+beautifulsoup4
+google-generativeai

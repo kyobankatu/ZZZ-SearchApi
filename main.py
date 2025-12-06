@@ -61,7 +61,7 @@ def get_info():
       return jsonify({"word": word, "info": "APIキーが設定されていないため要約できません。", "url": wiki_url})
 
     model = genai.GenerativeModel("gemini-2.5-flash")
-    prompt = f"以下のテキストはゲーム『Zenless Zone Zero』のWikiページ「{word}」の内容です。この用語について、日本語で簡潔に要約してください。\n\nテキスト:\n{page_text}"
+    prompt = f"以下のテキストはゲーム『Zenless Zone Zero』のWikiページ「{word}」の内容です。この用語について、日本語で簡潔に要約してください。ただし、知らないゲーム固有の単語は日本語にせず**で囲ってそのまま英語で出力して。\n\nテキスト:\n{page_text}"
     
     gemini_response = model.generate_content(prompt)
     summary = gemini_response.text

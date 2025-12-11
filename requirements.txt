@@ -3,4 +3,7 @@ flask_cors
 Gunicorn
 requests
 beautifulsoup4
-google-generativeai
+google-cloud-translate
+google-cloud-storage
+PyYAML
+openai

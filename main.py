@@ -2,21 +2,243 @@ from flask import *
 from flask_cors import CORS
 import requests
 from bs4 import BeautifulSoup
-import google.generativeai as genai
+from openai import OpenAI
+from google.cloud import translate_v3 as translate
+from google.cloud import storage
 import os
+import re
+import html
+import traceback
+import yaml
+import csv
+import io
+import difflib
 
 # 環境変数からAPIキーを取得
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
-# Geminiの設定
-if GEMINI_API_KEY:
-  genai.configure(api_key=GEMINI_API_KEY)
+# OpenRouterの設定
+client = None
+if OPENROUTER_API_KEY:
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=OPENROUTER_API_KEY,
+    )
+
+# 設定読み込み
+PROJECT_ID = None
+LOCATION = None
+GLOSSARY_ID = None
+GLOSSARY_BUCKET_NAME = None
+GLOSSARY_FILE_NAME = None
+AI_MODEL = None
+
+try:
+    with open('data.yml', 'r') as f:
+        config = yaml.safe_load(f)
+        PROJECT_ID = config.get('project_id')
+        LOCATION = config.get('location')
+        GLOSSARY_ID = config.get('glossary_id')
+        
+        if config.get('model'):
+            AI_MODEL = config.get('model') # data.ymlのモデル名をOpenRouter形式にする必要があります
+        
+        bucket_uri = config.get('bucket_uri')
+        if bucket_uri and bucket_uri.startswith("gs://"):
+            parts = bucket_uri[5:].split('/', 1)
+            if len(parts) == 2:
+                GLOSSARY_BUCKET_NAME = parts[0]
+                GLOSSARY_FILE_NAME = parts[1]
+            else:
+                print(f"[WARN] Invalid bucket_uri format: {bucket_uri}")
+
+except Exception as e:
+    print(f"[ERROR] Failed to load data.yml: {e}")
 
 WIKI_SEARCH_URL = "https://zenless-zone-zero.fandom.com/wiki/Special:Search?scope=internal&navigationSearch=true&query="
 
 app = Flask(__name__)
-
 CORS(app)
+
+# --- 用語集のロード処理 ---
+local_glossary = {}          # 英 -> 日 (要約結果の翻訳用)
+local_glossary_ja_to_en = {} # 日 -> 英 (検索ワードの翻訳用)
+
+def load_glossary_from_gcs():
+    """GCSからCSVをダウンロードしてメモリ上の辞書に展開する"""
+    global local_glossary, local_glossary_ja_to_en
+    if not PROJECT_ID or not GLOSSARY_BUCKET_NAME or not GLOSSARY_FILE_NAME:
+        print("[WARN] Glossary bucket/file not configured. Skipping local glossary load.")
+        return
+
+    try:
+        print(f"[INFO] Loading glossary from gs://{GLOSSARY_BUCKET_NAME}/{GLOSSARY_FILE_NAME} ...")
+        storage_client = storage.Client(project=PROJECT_ID)
+        bucket = storage_client.bucket(GLOSSARY_BUCKET_NAME)
+        blob = bucket.blob(GLOSSARY_FILE_NAME)
+        
+        # CSVデータを文字列としてダウンロード
+        csv_data = blob.download_as_text(encoding='utf-8')
+        
+        # CSV解析
+        f = io.StringIO(csv_data)
+        reader = csv.reader(f)
+        count = 0
+        for row in reader:
+            if len(row) >= 2:
+                en_term = row[0].strip()
+                ja_term = row[1].strip()
+                
+                # 英 -> 日
+                # CSVの先頭からマッチングさせるため、既にキーが存在する場合はスキップ（最初の定義を優先）
+                if en_term not in local_glossary:
+                    local_glossary[en_term] = ja_term
+                
+                # 日 -> 英 (逆引き用)
+                # 同様に最初の定義を優先
+                if ja_term not in local_glossary_ja_to_en:
+                    local_glossary_ja_to_en[ja_term] = en_term
+                
+                count += 1
+        
+        print(f"[INFO] Loaded {count} terms into local glossary.")
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to load glossary from GCS: {e}")
+
+# アプリ起動時に一度だけロード
+try:
+    load_glossary_from_gcs()
+except Exception as e:
+    print(f"[WARN] Initial glossary load failed: {e}")
+
+
+def get_best_match_link(soup, search_query):
+    """
+    検索結果のリストから、タイトルが検索クエリと完全一致するものを優先して返す。
+    一致するものがない場合は、一番上の結果を返す。
+    """
+    results = soup.select("li.unified-search__result")
+    if not results:
+        return None
+    
+    # 1. 完全一致を探す (Case-insensitive)
+    for result in results:
+        link = result.select_one("a.unified-search__result__title")
+        if link:
+            title = link.get("data-title") or link.get_text(strip=True)
+            if title and title.lower() == search_query.lower():
+                print(f"[DEBUG] Exact match found: {title}")
+                return link
+    
+    # 2. 見つからなければ一番上を返す
+    first_result = results[0].select_one("a.unified-search__result__title")
+    if first_result:
+        title = first_result.get("data-title") or first_result.get_text(strip=True)
+        print(f"[DEBUG] No exact match. Using first result: {title}")
+        return first_result
+    
+    return None
+
+
+def get_jp_wiki_usage(ja_term):
+    """
+    日本語Wikiのエージェント一覧から最も名前が近いキャラクターのページを探し、
+    「運用」セクションを取得する
+    """
+    if not ja_term:
+        return None
+        
+    list_url = "https://wikiwiki.jp/zenless/%E3%82%A8%E3%83%BC%E3%82%B8%E3%82%A7%E3%83%B3%E3%83%88%E4%B8%80%E8%A6%A7"
+    target_url = None
+    
+    # User-Agent ヘッダーを追加
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    
+    try:
+        print(f"[DEBUG] Searching JP Wiki list for: {ja_term}")
+        # headers 引数を追加
+        res = requests.get(list_url, headers=headers)
+        if res.status_code != 200:
+            print(f"[WARN] Failed to fetch agent list: {res.status_code}")
+            return None
+            
+        soup = BeautifulSoup(res.text, "html.parser")
+        
+        best_ratio = 0.0
+        best_link = None
+        best_name = None
+        
+        # キャラクター一覧のリンクを取得
+        links = soup.select("td a.rel-wiki-page")
+        
+        for link in links:
+            name = link.get_text(strip=True)
+            href = link.get("href")
+            
+            # 一致率を計算
+            ratio = difflib.SequenceMatcher(None, ja_term, name).ratio()
+            
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_link = href
+                best_name = name
+        
+        print(f"[DEBUG] Best match: {best_name} (Ratio: {best_ratio:.2f})")
+        
+        if best_ratio >= 0.4 and best_link:
+             target_url = "https://wikiwiki.jp" + best_link if best_link.startswith("/") else best_link
+        else:
+             print("[DEBUG] No close match found.")
+             return None
+
+    except Exception as e:
+        print(f"[WARN] Error searching JP Wiki list: {e}")
+        return None
+
+    try:
+        print(f"[DEBUG] Fetching JP Wiki page: {target_url}")
+        # ここにも headers 引数を追加
+        res = requests.get(target_url, headers=headers)
+        if res.status_code != 200:
+            print(f"[DEBUG] JP Wiki page not found: {res.status_code}")
+            return None
+            
+        soup = BeautifulSoup(res.text, "html.parser")
+        
+        # "運用" を含む h3 ヘッダーを探す
+        usage_header = None
+        for h3 in soup.select("h3"):
+            if "運用" in h3.get_text():
+                usage_header = h3
+                break
+        
+        if not usage_header:
+            print("[DEBUG] 'Usage' section not found in JP Wiki.")
+            return None
+            
+        # ヘッダー以降のコンテンツを抽出
+        content = []
+        curr = usage_header.next_sibling
+        while curr:
+            if curr.name in ['h2', 'h3']:
+                break
+            if curr.name: # タグの場合
+                text = curr.get_text(strip=True)
+                if text:
+                    content.append(text)
+            curr = curr.next_sibling
+            
+        result_text = "\n".join(content)[:3000]
+        print(f"[DEBUG] Fetched JP Wiki usage text ({len(result_text)} chars)")
+        return result_text
+
+    except Exception as e:
+        print(f"[WARN] Failed to fetch JP Wiki: {e}")
+        return None
+
 
 @app.route("/", methods=["GET", "POST"])
 def hello_world():
@@ -31,49 +253,228 @@ def get_info():
     if not word:
       return jsonify({"error": "No word provided"}), 400
 
-    # Wikiで検索を実行
-    search_response = requests.get(WIKI_SEARCH_URL + word)
-    search_soup = BeautifulSoup(search_response.text, "html.parser")
+    # 翻訳クライアントの初期化
+    translate_client = None
+    try:
+        translate_client = translate.TranslationServiceClient()
+    except Exception as e:
+        print(f"[WARN] Translation client initialization failed: {e}")
 
-    # 検索結果の最初のリンクを取得
-    # <a class="unified-search__result__title" href="...">
-    result_link = search_soup.select_one("li.unified-search__result a.unified-search__result__title")
+    search_word = word
+    result_link = None
+
+    # --- 1. ローカル用語集で検索 (日本語 -> 英語) ---
+    if word in local_glossary_ja_to_en:
+        search_word = local_glossary_ja_to_en[word]
+        print(f"[DEBUG] 1. Local glossary hit: {word} -> {search_word}")
+        
+        # 英語でWiki検索
+        print(f"[DEBUG] Searching Wiki for: {search_word}")
+        search_response = requests.get(WIKI_SEARCH_URL + search_word)
+        search_soup = BeautifulSoup(search_response.text, "html.parser")
+        result_link = get_best_match_link(search_soup, search_word)
+
+    # --- 2. 用語集になければ、まずは日本語のままで検索 ---
+    if not result_link:
+        print(f"[DEBUG] 2. Searching Wiki with original word (Japanese): {word}")
+        search_response = requests.get(WIKI_SEARCH_URL + word)
+        search_soup = BeautifulSoup(search_response.text, "html.parser")
+        result_link = get_best_match_link(search_soup, word)
+        
+        if result_link:
+            search_word = word # ヒットしたので検索ワードは日本語のまま
+
+    # --- 3. それでも見つからなければ、APIで英語に翻訳して検索 ---
+    if not result_link and translate_client and PROJECT_ID and LOCATION:
+        print(f"[DEBUG] 3. Page not found. Translating via API: '{word}' (ja -> en)")
+        try:
+            parent = f"projects/{PROJECT_ID}/locations/{LOCATION}"
+            glossary_path = translate_client.glossary_path(PROJECT_ID, LOCATION, GLOSSARY_ID)
+            glossary_config = translate.types.TranslateTextGlossaryConfig(glossary=glossary_path)
+
+            response = translate_client.translate_text(
+                request={
+                    "contents": [word],
+                    "target_language_code": "en",
+                    "source_language_code": "ja",
+                    "parent": parent,
+                    "glossary_config": glossary_config,
+                    "mime_type": "text/plain",
+                }
+            )
+
+            if response.glossary_translations:
+                translated_word = response.glossary_translations[0].translated_text
+                print("[DEBUG] Used glossary for search word")
+            else:
+                translated_word = response.translations[0].translated_text
+                print("[DEBUG] Used standard translation for search word")
+            
+            search_word = html.unescape(translated_word)
+            print(f"[DEBUG] Translated search word: '{search_word}'")
+
+            # 再検索実行
+            print(f"[DEBUG] Searching Wiki for: {search_word}")
+            search_response = requests.get(WIKI_SEARCH_URL + search_word)
+            search_soup = BeautifulSoup(search_response.text, "html.parser")
+            result_link = get_best_match_link(search_soup, search_word)
+
+        except Exception as e:
+            print(f"[ERROR] Search word translation failed: {e}")
 
     if not result_link:
-      return jsonify({"word": word, "info": "Wikiページが見つかりませんでした。"}), 404
+      return jsonify({"word": word, "search_word": search_word, "info": "Wikiページが見つかりませんでした。"}), 404
 
     wiki_url = result_link.get("href")
 
-    # 記事ページの内容を取得
+    # --- 記事ページの内容を取得 ---
+    print(f"[DEBUG] Fetching article content from: {wiki_url}")
     article_response = requests.get(wiki_url)
     article_soup = BeautifulSoup(article_response.text, "html.parser")
     
-    # Fandom Wikiの本文コンテンツを取得
     content_div = article_soup.select_one("#mw-content-text")
     if content_div:
-      # テキストのみを抽出し、長すぎる場合はカット
       page_text = content_div.get_text(strip=True)[:10000]
     else:
       page_text = "コンテンツの取得に失敗しました。"
 
-    # Geminiで要約
-    if not GEMINI_API_KEY:
-      return jsonify({"word": word, "info": "APIキーが設定されていないため要約できません。", "url": wiki_url})
+    # --- 日本語Wikiから運用情報を取得 (キャラクターの場合) ---
+    jp_wiki_text = ""
+    usage_text = get_jp_wiki_usage(word)
+    if usage_text:
+        jp_wiki_text = f"\n\n【日本語Wiki 運用情報】:\n{usage_text}"
 
-    model = genai.GenerativeModel("gemini-2.5-flash")
-    prompt = f"以下のテキストはゲーム『Zenless Zone Zero』のWikiページ「{word}」の内容です。この用語について、日本語で簡潔に要約してください。ただし、知らないゲーム固有の単語は日本語にせず**で囲ってそのまま英語で出力して。\n\nテキスト:\n{page_text}"
+    # --- Geminiで要約 (OpenRouter経由) ---
+    if not client:
+      return jsonify({"word": word, "info": "APIキー(OPENROUTER_API_KEY)が設定されていないため要約できません。", "url": wiki_url})
+
+    # model = genai.GenerativeModel(GEMINI_MODEL) <-- 削除
+    prompt = f"""以下のテキストはゲーム『Zenless Zone Zero』のWikiページ「{search_word}」の内容です。
+この用語がどのカテゴリ（プレイアブルキャラクター、音動機、ボンプ、場所・店、派閥、敵、その他）に属するかを内容から判断し、そのカテゴリに応じた観点で、日本語で簡潔に自然な文体で600字以下程度要約してください。
+
+【カテゴリ別の要約ポイント】
+- **プレイアブルキャラクター**: 所属、プロフィール、専用音動機の名前（英語名でExclusive W-Engine。「専用音動機は**〜**です。」という形式で記述）、および戦闘スタイルや能力の特徴。
+  ※「日本語Wiki 運用情報」が提供されている場合は、その内容を優先的に参照し、具体的な運用方法（コンボ、立ち回り、役割など）を詳しく解説に含めてください。ただし、このwikiの情報を元にした日本語の文章部分に関しては翻訳しないでください。
+- **音動機 (W-Engine)**: レアリティ、タイプ（強攻、撃破など）、ステータス特徴、および武器効果（パッシブスキル）の性能概要。
+- **ボンプ (Bangboo)**: ランク、アクティブスキルや連携スキルの特徴。
+- **場所・店**: 所在エリア、提供されるサービスや販売物、場所の特徴や雰囲気。
+- **派閥 (Faction)**: 構成メンバー、ストーリー上の役割や目的。
+- **その他**: 概要と重要な特徴。
+
+【出力の必須ルール】
+1. 出力の冒頭にカテゴリ名、タイトル、見出し（例: "## {search_word}", "プレイアブルキャラクター"など）を含めないこと。いきなり要約の本文から書き始めること。
+2. 何よりも重要なルールとして、ゲーム固有の単語や複合語、キャラクターの名前、アイテム名などは日本語に翻訳せず、英語のまま**で囲って出力すること（例: **Anby**, **Physical DMG**, **EX Special Attack**）。
+3. 文脈上、翻訳できそうな単語でもゲーム内用語であれば英語のまま**で囲むこと。
+4. **Godfinger**を**God** **Finger**のように分割したり改変しないこと。'&'で繋がっている語句はまとめて囲むこと。
+5. Wikiの出典やメタ情報は含めないこと。
+6. 「日本語Wikiによると」という旨の出典に関する文言は出力してはいけない。
+7. ですます調で統一すること。
+
+【出力前チェック】
+1. 固有名詞が全て**で囲まれているか確認すること。
+2. 指定されたカテゴリに基づいて要約が行われているか確認すること。
+3. **で囲まれたものが全て英単語であり、**で囲まれていない英単語がないか確認すること。
+4. 指定された出力ルールに従っているか確認すること。
+
+テキスト:
+{page_text}
+日本語Wiki 運用情報:
+{jp_wiki_text}"""
     
-    gemini_response = model.generate_content(prompt)
-    summary = gemini_response.text
+    print(f"--- [DEBUG] Prompt ---\n{prompt}\n----------------------")
+
+    try:
+        completion = client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        )
+        summary = completion.choices[0].message.content
+    except Exception as e:
+        print(f"[ERROR] OpenRouter API Error: {e}")
+        return jsonify({"error": f"AI generation failed: {str(e)}"}), 500
+    
+    print(f"--- [DEBUG] Response ---\n{summary}\n-------------------------------")
+
+    # --- 固有名詞の翻訳処理 (ハイブリッド方式) ---
+    matches = re.findall(r'\*\*(.*?)\*\*', summary)
+    print(f"[DEBUG] Extracted matches: {matches}")
+    
+    if matches:
+        unique_terms = list(set(matches))
+        term_map = {}
+        terms_to_api = []
+
+        # A. ローカル用語集で検索 (英 -> 日)
+        for term in unique_terms:
+            if term in local_glossary:
+                term_map[term] = local_glossary[term]
+                print(f"[DEBUG] Local glossary hit: {term} -> {local_glossary[term]}")
+            else:
+                terms_to_api.append(term)
+
+        # B. 見つからなかった単語だけAPIで翻訳
+        if terms_to_api and translate_client and PROJECT_ID and LOCATION:
+            print(f"[DEBUG] Terms to translate via API: {terms_to_api}")
+            text_to_translate = "\n".join(terms_to_api)
+            
+            try:
+                parent = f"projects/{PROJECT_ID}/locations/{LOCATION}"
+                glossary_path = translate_client.glossary_path(PROJECT_ID, LOCATION, GLOSSARY_ID)
+                glossary_config = translate.types.TranslateTextGlossaryConfig(glossary=glossary_path)
+
+                response = translate_client.translate_text(
+                    request={
+                        "contents": [text_to_translate],
+                        "target_language_code": "ja",
+                        "source_language_code": "en",
+                        "parent": parent,
+                        "glossary_config": glossary_config,
+                        "mime_type": "text/plain",
+                    }
+                )
+
+                if response.glossary_translations:
+                    translated_text_block = response.glossary_translations[0].translated_text
+                else:
+                    translated_text_block = response.translations[0].translated_text
+                
+                translated_text_block = html.unescape(translated_text_block)
+                translated_terms = translated_text_block.split("\n")
+                
+                for i, term in enumerate(terms_to_api):
+                    if i < len(translated_terms):
+                        term_map[term] = translated_terms[i].strip()
+                    else:
+                        term_map[term] = term
+
+            except Exception as e:
+                print(f"[ERROR] Translation API Error: {e}")
+                traceback.print_exc()
+        
+        # C. 置換実行
+        print(f"[DEBUG] Final Term Map: {term_map}")
+        def replace_match(match):
+            original_term = match.group(1)
+            return term_map.get(original_term, original_term)
+
+        summary = re.sub(r'\*\*(.*?)\*\*', replace_match, summary)
+        print(f"[DEBUG] Final Summary: {summary}")
 
     return jsonify({
       "word": word,
+      "search_word": search_word,
       "info": summary,
       "url": wiki_url
     })
 
   except Exception as e:
-    print(f"Error: {e}")
+    print(f"[ERROR] General Error: {e}")
+    traceback.print_exc()
     return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":

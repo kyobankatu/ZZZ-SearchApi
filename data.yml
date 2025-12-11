@@ -1,3 +1,5 @@
 project_id: "zzz-searchapp"
 location: "us-central1"
 glossary_id: "zzz-glossary"
+bucket_uri: "gs://zzz-glossary/zzz_glossary.csv"
+model: "tngtech/deepseek-r1t2-chimera:free"

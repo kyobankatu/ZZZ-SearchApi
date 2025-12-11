@@ -1,27 +1,20 @@
 # ZZZ-SearchApi
 
-Zenless Zone Zero (ゼンレスゾーンゼロ) のWikiを検索し、指定された用語の情報をAI (Gemini) を用いて要約して返すREST APIです。Google Cloud Runでの動作を想定して設計されています。
+『Zenless Zone Zero (ゼンレスゾーンゼロ)』のWiki情報を検索し、AIを用いて要約を提供するREST APIサーバーです。
 
-## 概要
+## プロジェクト概要
 
-ユーザーが送信した検索ワードに基づいて `Zenless Zone Zero Fandom Wiki` をスクレイピングし、該当する記事の本文を取得します。その後、Google Gemini APIを使用して情報を要約し、JSON形式でクライアントに返却します。
+ユーザーが指定した検索ワード（日本語または英語）に基づいて、英語のFandom Wikiおよび日本語のWikiwikiをスクレイピングし、関連情報を取得します。取得した情報はOpenRouter経由でAIモデルに送信され、カテゴリ（キャラクター、音動機など）に応じたフォーマットで要約されて返却されます。
 
-## 主な機能
+## 主要機能
 
-*   **用語検索**: Fandom Wiki内を検索し、最適な記事を特定。
-*   **AI要約**: 記事の長文テキストをGemini APIを用いて簡潔に要約。
-*   **固有名詞の保護**: ゲーム固有の用語や固有名詞を認識し、適切な形式で出力。
+*   **ハイブリッド検索**: ローカル用語集、日本語検索、翻訳APIを組み合わせた高精度な記事特定ロジック。
+*   **AI要約**: OpenRouter APIを使用し、Wikiの長文コンテンツを簡潔に要約。
+*   **日本語Wiki連携**: キャラクターの「運用」情報を日本語Wikiから取得し、要約に統合。
+*   **用語集対応**: Google Cloud Storage上のCSV用語集をロードし、固有名詞の翻訳精度を向上。
+*   **カテゴリ別フォーマット**: キャラクター、音動機、場所などのカテゴリを自動判別し、適切な構成で出力。
 
-## 技術スタック
-
-*   **言語**: Python 3.9
-*   **Webフレームワーク**: Flask
-*   **WSGIサーバー**: Gunicorn
-*   **AIモデル**: Google Gemini API (Generative AI)
-*   **スクレイピング**: BeautifulSoup4
-*   **インフラ**: Docker, Google Cloud Run
-
-## API仕様
+## 使用方法
 
 ### エンドポイント
 
@@ -29,41 +22,40 @@ Zenless Zone Zero (ゼンレスゾーンゼロ) のWikiを検索し、指定さ�
 
 ### リクエスト
 
-*   **Content-Type**: `application/json`
+**Content-Type**: `application/json`
 
 ```json
 {
-  "word": "検索したい用語 (例: Bangboo)"
+  "word": "検索したい用語 (例: アンビー)"
 }
 ```
 
 ### レスポンス
 
-成功時 (200 OK):
-
 ```json
 {
-  "word": "Bangboo",
-  "info": "AIによって生成された要約テキスト...",
-  "url": "https://zenless-zone-zero.fandom.com/wiki/Bangboo"
+  "word": "アンビー",
+  "search_word": "Anby Demara",
+  "info": "アンビー・デマラは... (AIによる要約)",
+  "url": "https://zenless-zone-zero.fandom.com/wiki/Anby_Demara"
 }
 ```
 
-エラー時 (404 Not Found など):
+## 動作環境
 
-```json
-{
-  "word": "検索語",
-  "info": "Wikiページが見つかりませんでした。"
-}
-```
+*   Python 3.9
+*   Docker
+*   Google Cloud Platform (Translation API, Cloud Storage)
+*   OpenRouter API
 
-## ローカルでの実行方法
+## インストール・実行方法
 
 ### 前提条件
 
-*   Docker がインストールされていること
-*   Google Gemini API キーを取得していること
+*   Dockerがインストールされていること。
+*   OpenRouterのAPIキーを取得していること。
+*   Google Cloudの認証情報（ADC）または権限設定が済んでいること（GCS/Translation API利用時）。
+*   `data.yml` に適切な設定が記述されていること。
 
 ### 手順
 
@@ -74,39 +66,45 @@ Zenless Zone Zero (ゼンレスゾーンゼロ) のWikiを検索し、指定さ�
     ```
 
 2.  **コンテナの起動**
-    APIキーを環境変数として渡して起動します。
 
     ```bash
     docker run --name zzz-search-api \
       -p 8080:8080 \
-      -e GEMINI_API_KEY="あなたのAPIキー" \
+      -e OPENROUTER_API_KEY="your_openrouter_api_key" \
       zzz-search-api
     ```
-
-3.  **動作確認**
-    別のターミナルからリクエストを送信して確認します。
-
-    ```bash
-    curl -X POST -H "Content-Type: application/json" \
-      -d '{"word": "Nicole Demara"}' \
-      http://localhost:8080/get_info
-    ```
-
-## Google Cloud Run へのデプロイ
-
-Google Cloud SDK (`gcloud`) を使用してデプロイします。
-
-```bash
-gcloud run deploy zzz-search-api \
-  --source . \
-  --region asia-northeast1 \
-  --allow-unauthenticated \
-  --set-env-vars GEMINI_API_KEY="あなたのAPIキー"
-```
+    ※ GCP認証のために、必要に応じてクレデンシャルファイルのボリュームマウントを行ってください。
 
 ## ファイル構成
 
-*   `main.py`: アプリケーションのメインロジック (Flask)
-*   `Dockerfile`: コンテナイメージの定義
-*   `requirements.txt`: Python依存ライブラリ一覧
-*   `data.yml`: Google Cloud
+*   `main.py`: APIサーバーのメインロジック。Flaskアプリケーション。
+*   `data.yml`: プロジェクト設定（GCPプロジェクトID、バケットURI、使用モデル等）。
+*   `Dockerfile`: コンテナ化のための定義ファイル。
+*   `requirements.txt`: Python依存パッケージリスト。
+
+## 制限事項・既知の問題
+
+*   WikiのHTML構造が変更された場合、スクレイピングが正常に動作しなくなる可能性があります。
+*   Google Cloud Translation APIおよびCloud Storageへのアクセス権限がない場合、一部機能（用語集ロード、翻訳）がスキップされます。
+*   日本語Wikiへのアクセスが頻繁に行われると、接続制限を受ける可能性があります。
+
+## 技術仕様
+
+*   **Webフレームワーク**: Flask, Gunicorn
+*   **AIクライアント**: OpenAI (OpenRouter経由)
+*   **スクレイピング**: BeautifulSoup4, requests
+*   **クラウド連携**: google-cloud-storage, google-cloud-translate
+N
+## ライセンス
+
+### ソースコード
+**Polyform Noncommercial License 1.0.0**
+
+本プロジェクトのソースコードは、**非営利目的でのみ**利用可能です。商用利用は固く禁止されています。
+詳細: [Polyform Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/)
+
+### 用語データ
+本ツールによって生成・抽出された用語データ（CSVファイル等）は、その元となるデータソース（Wiki等）のライセンスに従います。
+- **Zenless Zone Zero Wiki (Fandom)**: [CC BY-SA](https://www.fandom.com/licensing) (Creative Commons Attribution-ShareAlike)
+
+※ 本ツールは非公式のファンメイドプロジェクトであり、HoYoverse等の権利者とは一切関係ありません。

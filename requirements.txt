@@ -5,5 +5,7 @@ requests
 beautifulsoup4
 google-cloud-translate
 google-cloud-storage
+google-cloud-vision
+google-generativeai
 PyYAML
 openai

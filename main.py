@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 from openai import OpenAI
 from google.cloud import translate_v3 as translate
 from google.cloud import storage
+from google.cloud import vision
 import os
 import re
 import html
@@ -63,24 +64,24 @@ CORS(app)
 # --- 用語集のロード処理 ---
 local_glossary = {}          # 英 -> 日 (要約結果の翻訳用)
 local_glossary_ja_to_en = {} # 日 -> 英 (検索ワードの翻訳用)
+filter_list = {}             # 英 -> bool (True: 検索対象, False: 除外対象)
 
 def load_glossary_from_gcs():
     """GCSからCSVをダウンロードしてメモリ上の辞書に展開する"""
-    global local_glossary, local_glossary_ja_to_en
+    global local_glossary, local_glossary_ja_to_en, filter_list
     if not PROJECT_ID or not GLOSSARY_BUCKET_NAME or not GLOSSARY_FILE_NAME:
         print("[WARN] Glossary bucket/file not configured. Skipping local glossary load.")
         return
 
+    storage_client = storage.Client(project=PROJECT_ID)
+    bucket = storage_client.bucket(GLOSSARY_BUCKET_NAME)
+
+    # 1. 用語集 (zzz_glossary.csv) のロード
     try:
         print(f"[INFO] Loading glossary from gs://{GLOSSARY_BUCKET_NAME}/{GLOSSARY_FILE_NAME} ...")
-        storage_client = storage.Client(project=PROJECT_ID)
-        bucket = storage_client.bucket(GLOSSARY_BUCKET_NAME)
         blob = bucket.blob(GLOSSARY_FILE_NAME)
-        
-        # CSVデータを文字列としてダウンロード
         csv_data = blob.download_as_text(encoding='utf-8')
         
-        # CSV解析
         f = io.StringIO(csv_data)
         reader = csv.reader(f)
         count = 0
@@ -89,22 +90,47 @@ def load_glossary_from_gcs():
                 en_term = row[0].strip()
                 ja_term = row[1].strip()
                 
-                # 英 -> 日
-                # CSVの先頭からマッチングさせるため、既にキーが存在する場合はスキップ（最初の定義を優先）
                 if en_term not in local_glossary:
                     local_glossary[en_term] = ja_term
                 
-                # 日 -> 英 (逆引き用)
-                # 同様に最初の定義を優先
                 if ja_term not in local_glossary_ja_to_en:
                     local_glossary_ja_to_en[ja_term] = en_term
                 
                 count += 1
-        
         print(f"[INFO] Loaded {count} terms into local glossary.")
         
     except Exception as e:
         print(f"[ERROR] Failed to load glossary from GCS: {e}")
+
+    # 2. フィルタリスト (zzz_filter_list.csv) のロード
+    FILTER_FILE_NAME = "zzz_filter_list.csv"
+    try:
+        print(f"[INFO] Loading filter list from gs://{GLOSSARY_BUCKET_NAME}/{FILTER_FILE_NAME} ...")
+        blob = bucket.blob(FILTER_FILE_NAME)
+        if blob.exists():
+            csv_data = blob.download_as_text(encoding='utf-8')
+            f = io.StringIO(csv_data)
+            reader = csv.reader(f)
+            # ヘッダーをスキップするかチェック
+            header = next(reader, None)
+            if header and header[0] != "term":
+                # ヘッダーがない場合はポインタを戻す（簡易的な対応）
+                f.seek(0)
+            
+            count = 0
+            for row in reader:
+                if len(row) >= 2:
+                    term = row[0].strip()
+                    is_target_str = row[1].strip().lower()
+                    is_target = is_target_str == 'true'
+                    filter_list[term] = is_target
+                    count += 1
+            print(f"[INFO] Loaded {count} filter rules.")
+        else:
+            print(f"[WARN] Filter list not found at gs://{GLOSSARY_BUCKET_NAME}/{FILTER_FILE_NAME}")
+            
+    except Exception as e:
+        print(f"[ERROR] Failed to load filter list from GCS: {e}")
 
 # アプリ起動時に一度だけロード
 try:
@@ -476,6 +502,117 @@ def get_info():
     print(f"[ERROR] General Error: {e}")
     traceback.print_exc()
     return jsonify({"error": str(e)}), 500
+  
+@app.route("/scan", methods=["POST"])
+def scan_image():
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+        
+        file = request.files['image']
+        content = file.read()
+        
+        # Vision API クライアントの初期化
+        vision_client = vision.ImageAnnotatorClient()
+        image = vision.Image(content=content)
+        
+        # Web Detection の実行
+        print("[DEBUG] Calling Vision API web_detection...")
+        response = vision_client.web_detection(image=image)
+        annotations = response.web_detection
+        
+        print("\n--- [DEBUG] Vision API Web Detection Result ---")
+        
+        if annotations.best_guess_labels:
+            for label in annotations.best_guess_labels:
+                print(f"Best Guess Label: {label.label}")
+
+        if annotations.web_entities:
+            print("Web Entities:")
+            for entity in annotations.web_entities:
+                print(f" - Score: {entity.score:.4f}, Description: {entity.description}")
+        
+        print("-----------------------------------------------\n")
+        
+        if response.error.message:
+            print(f"[ERROR] Vision API Error: {response.error.message}")
+            return jsonify({"error": response.error.message}), 500
+
+        # --- 用語集を活用したフィルタリング (Whitelist方式 + AI Filter) ---
+        # Vision APIの候補の中から、local_glossary に存在する単語を探す
+        
+        candidates = []
+        # Web Entities (高精度)
+        if annotations.web_entities:
+            for entity in annotations.web_entities:
+                if entity.description:
+                    candidates.append(entity.description)
+        
+        # Best Guess Labels (補完)
+        if annotations.best_guess_labels:
+            for label in annotations.best_guess_labels:
+                candidates.append(label.label)
+
+        print(f"[DEBUG] Vision API Candidates: {candidates}")
+
+        detected_term = None
+        
+        # 用語集のキー（英語）をリスト化し、長い順にソート（部分一致の誤爆を防ぐため）
+        glossary_terms = sorted(local_glossary.keys(), key=len, reverse=True)
+
+        print(f"[DEBUG] Matching against {len(glossary_terms)} glossary terms...")
+
+        for candidate in candidates:
+            candidate_lower = candidate.lower()
+            
+            # 1. 完全一致チェック (Case-insensitive)
+            for term in glossary_terms:
+                if term.lower() == candidate_lower:
+                    # フィルタリストチェック
+                    if term in filter_list:
+                        if not filter_list[term]:
+                            print(f"[SKIP] Exact match found but filtered out: {term}")
+                            continue
+                    
+                    print(f"[MATCH] Exact match found: {candidate} == {term}")
+                    detected_term = term
+                    break
+            if detected_term: break
+
+            # 2. 部分一致チェック
+            for term in glossary_terms:
+                if len(term) < 3: continue
+                
+                if term.lower() in candidate_lower:
+                     # フィルタリストチェック
+                     if term in filter_list:
+                        if not filter_list[term]:
+                            print(f"[SKIP] Partial match found but filtered out: {term} in {candidate}")
+                            continue
+
+                     print(f"[MATCH] Partial match found: {term} in {candidate}")
+                     detected_term = term
+                     break
+            if detected_term: break
+        
+        if detected_term:
+            print(f"[INFO] Identified object as: {detected_term}")
+            # 特定した単語で検索を実行
+            response_data, status_code = search_and_summarize(detected_term)
+            response_data["detected_object"] = detected_term
+            return jsonify(response_data), status_code
+        else:
+            print("[WARN] No matching term found in glossary (or all matches were filtered).")
+            top_candidate = candidates[0] if candidates else "Unknown"
+            return jsonify({
+                "error": "Could not identify specific character or object from glossary.",
+                "top_candidate": top_candidate
+            }), 404
+
+    except Exception as e:
+        print(f"[ERROR] Scan failed: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
   app.run(threaded=True, host="0.0.0.0", port=5000)

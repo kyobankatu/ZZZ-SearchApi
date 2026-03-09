@@ -178,8 +178,6 @@ def main():
     # 後始末
     if os.path.exists(LOCAL_GLOSSARY_PATH):
         os.remove(LOCAL_GLOSSARY_PATH)
-    if os.path.exists(LOCAL_FILTER_LIST_PATH):
-        os.remove(LOCAL_FILTER_LIST_PATH)
 
     print("Done!")
 

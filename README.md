@@ -71,9 +71,13 @@
     docker run --name zzz-search-api \
       -p 8080:8080 \
       -e OPENROUTER_API_KEY="your_openrouter_api_key" \
+      -v ~/.config/gcloud:/root/.config/gcloud:ro \
       zzz-search-api
     ```
-    ※ GCP認証のために、必要に応じてクレデンシャルファイルのボリュームマウントを行ってください。
+
+    `-v` オプションにより、ホストマシンのGCP Application Default Credentials（ADC）をコンテナ内にマウントします。このオプションがない場合、GCS・Translation API・Vision APIの呼び出しが「Your default credentials were not found.」エラーで失敗します。
+
+    > **前提**: `gcloud auth application-default login` を事前に実行してADCを生成しておく必要があります。
 
 ## ファイル構成
 

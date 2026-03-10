@@ -27,36 +27,63 @@ if OPENROUTER_API_KEY:
     )
 
 # 設定読み込み
-PROJECT_ID = None
-LOCATION = None
-GLOSSARY_ID = None
-GLOSSARY_BUCKET_NAME = None
-GLOSSARY_FILE_NAME = None
-AI_MODEL = None
+project_id = None
+location = None
+glossary_id = None
+glossary_bucket_name = None
+glossary_file_name = None
+filter_bucket_name = None
+filter_file_name = None
+ai_model = None
 
 try:
     with open('data.yml', 'r') as f:
         config = yaml.safe_load(f)
-        PROJECT_ID = config.get('project_id')
-        LOCATION = config.get('location')
-        GLOSSARY_ID = config.get('glossary_id')
+        project_id = config.get('project_id')
+        location = config.get('location')
+        glossary_id = config.get('glossary_id')
         
         if config.get('model'):
-            AI_MODEL = config.get('model') # data.ymlのモデル名をOpenRouter形式にする必要があります
+            ai_model = config.get('model') # data.ymlのモデル名をOpenRouter形式にする必要があります
         
         bucket_uri = config.get('bucket_uri')
         if bucket_uri and bucket_uri.startswith("gs://"):
             parts = bucket_uri[5:].split('/', 1)
             if len(parts) == 2:
-                GLOSSARY_BUCKET_NAME = parts[0]
-                GLOSSARY_FILE_NAME = parts[1]
+                glossary_bucket_name = parts[0]
+                glossary_file_name = parts[1]
             else:
                 print(f"[WARN] Invalid bucket_uri format: {bucket_uri}")
+        # optional separate filter list URI
+        bucket_uri_filter = config.get('bucket_uri_filter')
+        if bucket_uri_filter and bucket_uri_filter.startswith("gs://"):
+            parts = bucket_uri_filter[5:].split('/', 1)
+            if len(parts) == 2:
+                filter_bucket_name = parts[0]
+                filter_file_name = parts[1]
+            else:
+                print(f"[WARN] Invalid bucket_uri_filter format: {bucket_uri_filter}")
+        else:
+            # default to same bucket and default filename
+            filter_bucket_name = glossary_bucket_name
+            filter_file_name = "zzz_filter_list.csv"
 
 except Exception as e:
     print(f"[ERROR] Failed to load data.yml: {e}")
 
+# Assign to uppercase constants after loading config
+PROJECT_ID = project_id
+LOCATION = location
+GLOSSARY_ID = glossary_id
+GLOSSARY_BUCKET_NAME = glossary_bucket_name
+GLOSSARY_FILE_NAME = glossary_file_name
+FILTER_BUCKET_NAME = filter_bucket_name
+FILTER_FILE_NAME = filter_file_name
+AI_MODEL = ai_model
+
 WIKI_SEARCH_URL = "https://zenless-zone-zero.fandom.com/wiki/Special:Search?scope=internal&navigationSearch=true&query="
+WIKI_API_URL = "https://zenless-zone-zero.fandom.com/api.php"
+WIKI_ARTICLE_URL = "https://zenless-zone-zero.fandom.com/wiki/"
 
 app = Flask(__name__)
 CORS(app)
@@ -139,6 +166,38 @@ except Exception as e:
     print(f"[WARN] Initial glossary load failed: {e}")
 
 
+def search_wiki(search_query):
+    """
+    MediaWiki APIを使って検索し、最も一致する記事のURLを返す。
+    完全一致を優先し、なければ最上位の結果を返す。
+    """
+    try:
+        response = requests.get(WIKI_API_URL, params={
+            "action": "query",
+            "list": "search",
+            "srsearch": search_query,
+            "srlimit": 5,
+            "format": "json",
+        }, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"})
+        results = response.json().get("query", {}).get("search", [])
+        if not results:
+            print(f"[DEBUG] Wiki API returned no results for: {search_query}")
+            return None
+
+        for result in results:
+            if result["title"].lower() == search_query.lower():
+                print(f"[DEBUG] Exact match found: {result['title']}")
+                return WIKI_ARTICLE_URL + result["title"].replace(" ", "_")
+
+        title = results[0]["title"]
+        print(f"[DEBUG] No exact match. Using first result: {title}")
+        return WIKI_ARTICLE_URL + title.replace(" ", "_")
+
+    except Exception as e:
+        print(f"[WARN] Wiki API search failed: {e}")
+        return None
+
+
 def get_best_match_link(soup, search_query):
     """
     検索結果のリストから、タイトルが検索クエリと完全一致するものを優先して返す。
@@ -215,7 +274,7 @@ def get_jp_wiki_usage(ja_term):
         print(f"[DEBUG] Best match: {best_name} (Ratio: {best_ratio:.2f})")
         
         if best_ratio >= 0.4 and best_link:
-             target_url = "https://wikiwiki.jp" + best_link if best_link.startswith("/") else best_link
+             target_url = "https://wikiwiki.jp" + str(best_link) if str(best_link).startswith("/") else str(best_link)
         else:
              print("[DEBUG] No close match found.")
              return None
@@ -248,10 +307,11 @@ def get_jp_wiki_usage(ja_term):
         # ヘッダー以降のコンテンツを抽出
         content = []
         curr = usage_header.next_sibling
+        from bs4 import Tag
         while curr:
-            if curr.name in ['h2', 'h3']:
+            if isinstance(curr, Tag) and curr.name in ['h2', 'h3']:
                 break
-            if curr.name: # タグの場合
+            if isinstance(curr, Tag):
                 text = curr.get_text(strip=True)
                 if text:
                     content.append(text)
@@ -296,17 +356,12 @@ def get_info():
         
         # 英語でWiki検索
         print(f"[DEBUG] Searching Wiki for: {search_word}")
-        search_response = requests.get(WIKI_SEARCH_URL + search_word)
-        search_soup = BeautifulSoup(search_response.text, "html.parser")
-        result_link = get_best_match_link(search_soup, search_word)
+        result_link = search_wiki(search_word)
 
     # --- 2. 用語集になければ、まずは日本語のままで検索 ---
     if not result_link:
         print(f"[DEBUG] 2. Searching Wiki with original word (Japanese): {word}")
-        search_response = requests.get(WIKI_SEARCH_URL + word)
-        search_soup = BeautifulSoup(search_response.text, "html.parser")
-        result_link = get_best_match_link(search_soup, word)
-        
+        result_link = search_wiki(word)
         if result_link:
             search_word = word # ヒットしたので検索ワードは日本語のまま
 
@@ -315,8 +370,11 @@ def get_info():
         print(f"[DEBUG] 3. Page not found. Translating via API: '{word}' (ja -> en)")
         try:
             parent = f"projects/{PROJECT_ID}/locations/{LOCATION}"
-            glossary_path = translate_client.glossary_path(PROJECT_ID, LOCATION, GLOSSARY_ID)
-            glossary_config = translate.types.TranslateTextGlossaryConfig(glossary=glossary_path)
+            if GLOSSARY_ID:
+                glossary_path = translate_client.glossary_path(PROJECT_ID, LOCATION, GLOSSARY_ID)
+                glossary_config = translate.types.TranslateTextGlossaryConfig(glossary=glossary_path)
+            else:
+                glossary_config = None
 
             response = translate_client.translate_text(
                 request={
@@ -341,9 +399,7 @@ def get_info():
 
             # 再検索実行
             print(f"[DEBUG] Searching Wiki for: {search_word}")
-            search_response = requests.get(WIKI_SEARCH_URL + search_word)
-            search_soup = BeautifulSoup(search_response.text, "html.parser")
-            result_link = get_best_match_link(search_soup, search_word)
+            result_link = search_wiki(search_word)
 
         except Exception as e:
             print(f"[ERROR] Search word translation failed: {e}")
@@ -351,18 +407,25 @@ def get_info():
     if not result_link:
       return jsonify({"word": word, "search_word": search_word, "info": "Wikiページが見つかりませんでした。"}), 404
 
-    wiki_url = result_link.get("href")
+    wiki_url = result_link
 
     # --- 記事ページの内容を取得 ---
     print(f"[DEBUG] Fetching article content from: {wiki_url}")
-    article_response = requests.get(wiki_url)
-    article_soup = BeautifulSoup(article_response.text, "html.parser")
-    
-    content_div = article_soup.select_one("#mw-content-text")
-    if content_div:
-      page_text = content_div.get_text(strip=True)[:10000]
+    page_title = wiki_url.replace(WIKI_ARTICLE_URL, "")
+    article_api_response = requests.get(WIKI_API_URL, params={
+        "action": "parse",
+        "page": page_title,
+        "prop": "text",
+        "format": "json",
+    }, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"})
+    article_data = article_api_response.json()
+    article_html = article_data.get("parse", {}).get("text", {}).get("*", "")
+    if article_html:
+        article_soup = BeautifulSoup(article_html, "html.parser")
+        page_text = article_soup.get_text(strip=True)[:10000]
     else:
-      page_text = "コンテンツの取得に失敗しました。"
+        print(f"[WARN] Article parse API returned no content. Error: {article_data.get('error')}")
+        page_text = "コンテンツの取得に失敗しました。"
 
     # --- 日本語Wikiから運用情報を取得 (キャラクターの場合) ---
     jp_wiki_text = ""
@@ -376,39 +439,42 @@ def get_info():
 
     # model = genai.GenerativeModel(GEMINI_MODEL) <-- 削除
     prompt = f"""以下のテキストはゲーム『Zenless Zone Zero』のWikiページ「{search_word}」の内容です。
-この用語がどのカテゴリ（プレイアブルキャラクター、音動機、ボンプ、場所・店、派閥、敵、その他）に属するかを内容から判断し、そのカテゴリに応じた観点で、日本語で簡潔に自然な文体で600字以下程度要約してください。
+                この用語がどのカテゴリ（プレイアブルキャラクター、音動機、ボンプ、場所・店、派閥、敵、その他）に属するかを内容から判断し、そのカテゴリに応じた観点で、日本語で簡潔に自然な文体で600字以下程度要約してください。
 
-【カテゴリ別の要約ポイント】
-- **プレイアブルキャラクター**: 所属、プロフィール、専用音動機の名前（英語名でExclusive W-Engine。「専用音動機は**〜**です。」という形式で記述）、および戦闘スタイルや能力の特徴。
-  ※「日本語Wiki 運用情報」が提供されている場合は、その内容を優先的に参照し、具体的な運用方法（コンボ、立ち回り、役割など）を詳しく解説に含めてください。ただし、このwikiの情報を元にした日本語の文章部分に関しては翻訳しないでください。
-- **音動機 (W-Engine)**: レアリティ、タイプ（強攻、撃破など）、ステータス特徴、および武器効果（パッシブスキル）の性能概要。
-- **ボンプ (Bangboo)**: ランク、アクティブスキルや連携スキルの特徴。
-- **場所・店**: 所在エリア、提供されるサービスや販売物、場所の特徴や雰囲気。
-- **派閥 (Faction)**: 構成メンバー、ストーリー上の役割や目的。
-- **その他**: 概要と重要な特徴。
+                【カテゴリ別の要約ポイント】
+                - **プレイアブルキャラクター**: 所属、プロフィール、専用音動機の名前（英語名でExclusive W-Engine。「専用音動機は**〜**です。」という形式で記述）、および戦闘スタイルや能力の特徴。
+                ※「日本語Wiki 運用情報」が提供されている場合は、その内容を優先的に参照し、具体的な運用方法（コンボ、立ち回り、役割など）を詳しく解説に含めてください。ただし、このwikiの情報を元にした日本語の文章部分に関しては翻訳しないでください。
+                - **音動機 (W-Engine)**: レアリティ、タイプ（強攻、撃破など）、ステータス特徴、および武器効果（パッシブスキル）の性能概要。
+                - **ボンプ (Bangboo)**: ランク、アクティブスキルや連携スキルの特徴。
+                - **場所・店**: 所在エリア、提供されるサービスや販売物、場所の特徴や雰囲気。
+                - **派閥 (Faction)**: 構成メンバー、ストーリー上の役割や目的。
+                - **その他**: 概要と重要な特徴。
 
-【出力の必須ルール】
-1. 出力の冒頭にカテゴリ名、タイトル、見出し（例: "## {search_word}", "プレイアブルキャラクター"など）を含めないこと。いきなり要約の本文から書き始めること。
-2. 何よりも重要なルールとして、ゲーム固有の単語や複合語、キャラクターの名前、アイテム名などは日本語に翻訳せず、英語のまま**で囲って出力すること（例: **Anby**, **Physical DMG**, **EX Special Attack**）。
-3. 文脈上、翻訳できそうな単語でもゲーム内用語であれば英語のまま**で囲むこと。
-4. **Godfinger**を**God** **Finger**のように分割したり改変しないこと。'&'で繋がっている語句はまとめて囲むこと。
-5. Wikiの出典やメタ情報は含めないこと。
-6. 「日本語Wikiによると」という旨の出典に関する文言は出力してはいけない。
-7. ですます調で統一すること。
+                【出力の必須ルール】
+                1. 出力の冒頭にカテゴリ名、タイトル、見出し（例: "## {search_word}", "プレイアブルキャラクター"など）を含めないこと。いきなり要約の本文から書き始めること。
+                2. 何よりも重要なルールとして、ゲーム固有の単語や複合語、キャラクターの名前、アイテム名などは日本語に翻訳せず、英語のまま**で囲って出力すること（例: **Anby**, **Physical DMG**, **EX Special Attack**）。
+                3. 文脈上、翻訳できそうな単語でもゲーム内用語であれば英語のまま**で囲むこと。
+                4. **Godfinger**を**God** **Finger**のように分割したり改変しないこと。'&'で繋がっている語句はまとめて囲むこと。
+                5. Wikiの出典やメタ情報は含めないこと。
+                6. 「日本語Wikiによると」という旨の出典に関する文言は出力してはいけない。
+                7. ですます調で統一すること。
 
-【出力前チェック】
-1. 固有名詞が全て**で囲まれているか確認すること。
-2. 指定されたカテゴリに基づいて要約が行われているか確認すること。
-3. **で囲まれたものが全て英単語であり、**で囲まれていない英単語がないか確認すること。
-4. 指定された出力ルールに従っているか確認すること。
+                【出力前チェック】
+                1. 固有名詞が全て**で囲まれているか確認すること。
+                2. 指定されたカテゴリに基づいて要約が行われているか確認すること。
+                3. **で囲まれたものが全て英単語であり、**で囲まれていない英単語がないか確認すること。
+                4. 指定された出力ルールに従っているか確認すること。
 
-テキスト:
-{page_text}
-日本語Wiki 運用情報:
-{jp_wiki_text}"""
+                テキスト:
+                {page_text}
+                日本語Wiki 運用情報:
+                {jp_wiki_text}"""
     
     print(f"--- [DEBUG] Prompt ---\n{prompt}\n----------------------")
 
+    if not AI_MODEL:
+        print("[ERROR] AI_MODEL is not set.")
+        return jsonify({"error": "AIモデルが設定されていません。"}), 500
     try:
         completion = client.chat.completions.create(
             model=AI_MODEL,
@@ -427,7 +493,9 @@ def get_info():
     print(f"--- [DEBUG] Response ---\n{summary}\n-------------------------------")
 
     # --- 固有名詞の翻訳処理 (ハイブリッド方式) ---
-    matches = re.findall(r'\*\*(.*?)\*\*', summary)
+    matches = []
+    if summary is not None:
+        matches = re.findall(r'\*\*(.*?)\*\*', summary)
     print(f"[DEBUG] Extracted matches: {matches}")
     
     if matches:
@@ -488,7 +556,14 @@ def get_info():
             original_term = match.group(1)
             return term_map.get(original_term, original_term)
 
-        summary = re.sub(r'\*\*(.*?)\*\*', replace_match, summary)
+        if summary is None:
+            print("[WARN] Summary is None, skipping replacement.")
+        else:
+            try:
+              summary = re.sub(r'\*\*(.*?)\*\*', replace_match, summary)
+            except Exception as e:
+              print(f"[ERROR] Failed to replace terms in summary: {e}")
+              traceback.print_exc()
         print(f"[DEBUG] Final Summary: {summary}")
 
     return jsonify({
@@ -538,76 +613,38 @@ def scan_image():
             print(f"[ERROR] Vision API Error: {response.error.message}")
             return jsonify({"error": response.error.message}), 500
 
-        # --- 用語集を活用したフィルタリング (Whitelist方式 + AI Filter) ---
-        # Vision APIの候補の中から、local_glossary に存在する単語を探す
-        
+        # --- フィルタリストによるフィルタリング ---
         candidates = []
-        # Web Entities (高精度)
         if annotations.web_entities:
             for entity in annotations.web_entities:
                 if entity.description:
                     candidates.append(entity.description)
-        
-        # Best Guess Labels (補完)
         if annotations.best_guess_labels:
             for label in annotations.best_guess_labels:
                 candidates.append(label.label)
 
         print(f"[DEBUG] Vision API Candidates: {candidates}")
 
-        detected_term = None
-        
-        # 用語集のキー（英語）をリスト化し、長い順にソート（部分一致の誤爆を防ぐため）
-        glossary_terms = sorted(local_glossary.keys(), key=len, reverse=True)
-
-        print(f"[DEBUG] Matching against {len(glossary_terms)} glossary terms...")
-
+        filtered = []
+        filtered_out = []
         for candidate in candidates:
-            candidate_lower = candidate.lower()
-            
-            # 1. 完全一致チェック (Case-insensitive)
-            for term in glossary_terms:
-                if term.lower() == candidate_lower:
-                    # フィルタリストチェック
-                    if term in filter_list:
-                        if not filter_list[term]:
-                            print(f"[SKIP] Exact match found but filtered out: {term}")
-                            continue
-                    
-                    print(f"[MATCH] Exact match found: {candidate} == {term}")
-                    detected_term = term
-                    break
-            if detected_term: break
+            # 完全一致でフィルタリストを参照
+            if candidate in filter_list:
+                if filter_list[candidate]:
+                    filtered.append(candidate)
+                else:
+                    filtered_out.append(candidate)
+            else:
+                filtered_out.append(candidate)
 
-            # 2. 部分一致チェック
-            for term in glossary_terms:
-                if len(term) < 3: continue
-                
-                if term.lower() in candidate_lower:
-                     # フィルタリストチェック
-                     if term in filter_list:
-                        if not filter_list[term]:
-                            print(f"[SKIP] Partial match found but filtered out: {term} in {candidate}")
-                            continue
+        print(f"[DEBUG] Filtered IN (検索対象): {filtered}")
+        print(f"[DEBUG] Filtered OUT (除外): {filtered_out}")
 
-                     print(f"[MATCH] Partial match found: {term} in {candidate}")
-                     detected_term = term
-                     break
-            if detected_term: break
-        
-        if detected_term:
-            print(f"[INFO] Identified object as: {detected_term}")
-            # 特定した単語で検索を実行
-            response_data, status_code = search_and_summarize(detected_term)
-            response_data["detected_object"] = detected_term
-            return jsonify(response_data), status_code
-        else:
-            print("[WARN] No matching term found in glossary (or all matches were filtered).")
-            top_candidate = candidates[0] if candidates else "Unknown"
-            return jsonify({
-                "error": "Could not identify specific character or object from glossary.",
-                "top_candidate": top_candidate
-            }), 404
+        return jsonify({
+            "filtered_in": filtered,
+            "filtered_out": filtered_out,
+            "all_candidates": candidates
+        })
 
     except Exception as e:
         print(f"[ERROR] Scan failed: {e}")

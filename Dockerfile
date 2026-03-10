@@ -22,4 +22,4 @@ COPY data.yml /app/data.yml
 RUN pip install --no-cache-dir -r requirements.txt
 
 # アプリケーションのエントリーポイント
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "main:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--timeout", "120", "main:app"]

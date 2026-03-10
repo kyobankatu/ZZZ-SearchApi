@@ -326,6 +326,26 @@ def get_jp_wiki_usage(ja_term):
         return None
 
 
+def wrap_unwrapped_english(text):
+    """
+    AIの要約結果に含まれる、**で囲まれていない英語フレーズを**で囲む。
+    既に**で囲まれている部分はそのまま保持する。
+    """
+    placeholders = []
+
+    def save(m):
+        placeholders.append(m.group(0))
+        return f"\x00{len(placeholders) - 1}\x00"
+
+    temp = re.sub(r'\*\*.*?\*\*', save, text)
+    temp = re.sub(r'[A-Za-z][A-Za-z0-9 &\'\-/%+]*[A-Za-z0-9]|[A-Za-z]', lambda m: f'**{m.group(0)}**', temp)
+
+    def restore(m):
+        return placeholders[int(m.group(1))]
+
+    return re.sub(r'\x00(\d+)\x00', restore, temp)
+
+
 @app.route("/", methods=["GET", "POST"])
 def hello_world():
   return "Hello, World!"
@@ -422,7 +442,7 @@ def get_info():
     article_html = article_data.get("parse", {}).get("text", {}).get("*", "")
     if article_html:
         article_soup = BeautifulSoup(article_html, "html.parser")
-        page_text = article_soup.get_text(strip=True)[:10000]
+        page_text = article_soup.get_text(strip=True)[:5000]
     else:
         print(f"[WARN] Article parse API returned no content. Error: {article_data.get('error')}")
         page_text = "コンテンツの取得に失敗しました。"
@@ -486,10 +506,11 @@ def get_info():
             ]
         )
         summary = completion.choices[0].message.content
+        summary = wrap_unwrapped_english(summary)
     except Exception as e:
         print(f"[ERROR] OpenRouter API Error: {e}")
         return jsonify({"error": f"AI generation failed: {str(e)}"}), 500
-    
+
     print(f"--- [DEBUG] Response ---\n{summary}\n-------------------------------")
 
     # --- 固有名詞の翻訳処理 (ハイブリッド方式) ---

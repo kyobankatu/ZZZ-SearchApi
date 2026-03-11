@@ -141,34 +141,37 @@ except Exception as e:
 
 def search_wiki(search_query):
     """
-    MediaWiki APIを使って検索し、最も一致する記事のURLを返す。
-    完全一致を優先し、なければ最上位の結果を返す。
+    MediaWiki APIを使って検索し、最大10件の候補を返す。
+    完全一致が見つかった場合はそれをリストの先頭に移動する。
+    戻り値: [{"title": str, "url": str}, ...] (結果なしの場合は空リスト)
     """
     try:
         response = requests.get(WIKI_API_URL, params={
             "action": "query",
             "list": "search",
             "srsearch": search_query,
-            "srlimit": 5,
+            "srlimit": 10,
             "format": "json",
         }, headers=BROWSER_HEADERS)
         results = response.json().get("query", {}).get("search", [])
         if not results:
             print(f"[DEBUG] Wiki API returned no results for: {search_query}")
-            return None
+            return []
 
-        for result in results:
-            if result["title"].lower() == search_query.lower():
-                print(f"[DEBUG] Exact match found: {result['title']}")
-                return WIKI_ARTICLE_URL + result["title"].replace(" ", "_")
+        candidates = [{"title": r["title"], "url": WIKI_ARTICLE_URL + r["title"].replace(" ", "_")} for r in results]
 
-        title = results[0]["title"]
-        print(f"[DEBUG] No exact match. Using first result: {title}")
-        return WIKI_ARTICLE_URL + title.replace(" ", "_")
+        for i, candidate in enumerate(candidates):
+            if candidate["title"].lower() == search_query.lower():
+                print(f"[DEBUG] Exact match found: {candidate['title']}")
+                candidates.insert(0, candidates.pop(i))
+                return candidates
+
+        print(f"[DEBUG] No exact match. Using first result: {candidates[0]['title']}")
+        return candidates
 
     except Exception as e:
         print(f"[WARN] Wiki API search failed: {e}")
-        return None
+        return []
 
 
 def get_jp_wiki_usage(ja_term):
@@ -288,20 +291,24 @@ def get_info():
 
         search_word = word
         wiki_url = None
+        search_candidates = []
 
         # 1. ローカル用語集で変換 (JA -> EN) して検索
         if word in local_glossary_ja_to_en:
             search_word = local_glossary_ja_to_en[word]
             print(f"[DEBUG] 1. Local glossary hit: {word} -> {search_word}")
             print(f"[DEBUG] Searching Wiki for: {search_word}")
-            wiki_url = search_wiki(search_word)
+            search_candidates = search_wiki(search_word)
+            if search_candidates:
+                wiki_url = search_candidates[0]["url"]
 
         # 2. 用語集にない場合、日本語のまま検索
         if not wiki_url:
             print(f"[DEBUG] 2. Searching Wiki with original word (Japanese): {word}")
-            wiki_url = search_wiki(word)
-            if wiki_url:
+            search_candidates = search_wiki(word)
+            if search_candidates:
                 search_word = word
+                wiki_url = search_candidates[0]["url"]
 
         # 3. それでも見つからなければ、Translation APIで英訳して検索
         if not wiki_url and translate_client and PROJECT_ID and LOCATION:
@@ -334,7 +341,9 @@ def get_info():
                 search_word = html.unescape(translated_word)
                 print(f"[DEBUG] Translated search word: '{search_word}'")
                 print(f"[DEBUG] Searching Wiki for: {search_word}")
-                wiki_url = search_wiki(search_word)
+                search_candidates = search_wiki(search_word)
+                if search_candidates:
+                    wiki_url = search_candidates[0]["url"]
 
             except Exception as e:
                 print(f"[ERROR] Search word translation failed: {e}")
@@ -355,7 +364,7 @@ def get_info():
         article_title = article_data.get("parse", {}).get("title", search_word)
         article_html = article_data.get("parse", {}).get("text", {}).get("*", "")
         if article_html:
-            page_text = BeautifulSoup(article_html, "html.parser").get_text(strip=True)[:5000]
+            page_text = BeautifulSoup(article_html, "html.parser").get_text(strip=True)[:10000]
         else:
             print(f"[WARN] Article parse API returned no content. Error: {article_data.get('error')}")
             page_text = "コンテンツの取得に失敗しました。"
@@ -478,6 +487,7 @@ def get_info():
             "search_word": search_word,
             "info": summary,
             "url": wiki_url,
+            "candidates": search_candidates,
         })
 
     except Exception as e:

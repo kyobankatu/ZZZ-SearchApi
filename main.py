@@ -352,6 +352,7 @@ def get_info():
             "format": "json",
         }, headers=BROWSER_HEADERS)
         article_data = article_api_response.json()
+        article_title = article_data.get("parse", {}).get("title", search_word)
         article_html = article_data.get("parse", {}).get("text", {}).get("*", "")
         if article_html:
             page_text = BeautifulSoup(article_html, "html.parser").get_text(strip=True)[:5000]
@@ -370,7 +371,7 @@ def get_info():
             print("[ERROR] AI_MODEL is not set.")
             return jsonify({"error": "AIモデルが設定されていません。"}), 500
 
-        prompt = f"""以下のテキストはゲーム『Zenless Zone Zero』のWikiページ「{search_word}」の内容です。
+        prompt = f"""以下のテキストはゲーム『Zenless Zone Zero』のWikiページ「{article_title}」の内容です。
                 この用語がどのカテゴリ（プレイアブルキャラクター、音動機、ボンプ、場所・店、派閥、敵、その他）に属するかを内容から判断し、そのカテゴリに応じた観点で、日本語で簡潔に自然な文体で600字以下程度要約してください。
 
                 【カテゴリ別の要約ポイント】
@@ -383,7 +384,7 @@ def get_info():
                 - **その他**: 概要と重要な特徴。
 
                 【出力の必須ルール】
-                1. 出力の冒頭にカテゴリ名、タイトル、見出し（例: "## {search_word}", "プレイアブルキャラクター"など）を含めないこと。いきなり要約の本文から書き始めること。
+                1. 出力の冒頭にカテゴリ名、タイトル、見出し（例: "## {article_title}", "プレイアブルキャラクター"など）を含めないこと。いきなり要約の本文から書き始めること。
                 2. 何よりも重要なルールとして、ゲーム固有の単語や複合語、キャラクターの名前、アイテム名などは日本語に翻訳せず、英語のまま**で囲って出力すること（例: **Anby**, **Physical DMG**, **EX Special Attack**）。
                 3. 文脈上、翻訳できそうな単語でもゲーム内用語であれば英語のまま**で囲むこと。
                 4. **Godfinger**を**God** **Finger**のように分割したり改変しないこと。'&'で繋がっている語句はまとめて囲むこと。

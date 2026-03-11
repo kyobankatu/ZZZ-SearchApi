@@ -14,6 +14,7 @@ import yaml
 import csv
 import io
 import difflib
+import base64
 
 # --- 定数 ---
 BROWSER_HEADERS = {
@@ -40,6 +41,7 @@ GLOSSARY_FILE_NAME = None
 FILTER_BUCKET_NAME = None
 FILTER_FILE_NAME = None
 AI_MODEL = None
+AI_MODEL_SCAN = None
 
 try:
     with open('data.yml', 'r') as f:
@@ -48,6 +50,7 @@ try:
         LOCATION = config.get('location')
         GLOSSARY_ID = config.get('glossary_id')
         AI_MODEL = config.get('model')
+        AI_MODEL_SCAN = config.get('model_scan')
 
         bucket_uri = config.get('bucket_uri', '')
         if bucket_uri.startswith("gs://"):
@@ -482,6 +485,61 @@ def get_info():
         return jsonify({"error": str(e)}), 500
 
 
+def fuzzy_match_filter(candidate):
+    """filter_listに対してcandidateをファジーマッチする。
+    大文字小文字を無視し、candidateまたはfilter_listのキーが互いに部分文字列として含まれる場合にマッチとみなす。
+    誤検知防止のため、candidateの長さが3未満の場合はマッチしない。
+    """
+    if len(candidate) < 3:
+        return False
+    candidate_lower = candidate.lower()
+    for key, is_target in filter_list.items():
+        if not is_target:
+            continue
+        key_lower = key.lower()
+        if candidate_lower in key_lower or key_lower in candidate_lower:
+            return True
+    return False
+
+
+def identify_zzz_objects_via_llm(image_content):
+    """multimodalモデルを使ってZZZのキャラクターやオブジェクトを識別し、候補リストを返す。"""
+    if not client or not AI_MODEL_SCAN:
+        print("[WARN] OpenRouter client or model_scan not configured. Skipping LLM fallback.")
+        return []
+
+    image_b64 = base64.b64encode(image_content).decode("utf-8")
+    prompt = (
+        "This is a screenshot from the game Zenless Zone Zero (ZZZ). "
+        "List the names of any ZZZ characters, weapons, bangboos, or game-specific objects you can identify in the image. "
+        "Reply with only a comma-separated list of English names. "
+        "If you cannot identify any ZZZ-specific content, reply with an empty string."
+    )
+
+    try:
+        print("[DEBUG] Calling multimodal LLM for ZZZ object identification...")
+        completion = client.chat.completions.create(
+            model=AI_MODEL_SCAN,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ],
+        )
+        raw = completion.choices[0].message.content.strip()
+        print(f"[DEBUG] LLM raw response: {raw}")
+        if not raw:
+            return []
+        return [name.strip() for name in raw.split(",") if name.strip()]
+    except Exception as e:
+        print(f"[ERROR] LLM fallback failed: {e}")
+        return []
+
+
 @app.route("/scan", methods=["POST"])
 def scan_image():
     try:
@@ -517,13 +575,28 @@ def scan_image():
         filtered = []
         filtered_out = []
         for candidate in candidates:
-            if filter_list.get(candidate):
+            if fuzzy_match_filter(candidate):
                 filtered.append(candidate)
             else:
                 filtered_out.append(candidate)
 
         print(f"[DEBUG] Filtered IN (検索対象): {filtered}")
         print(f"[DEBUG] Filtered OUT (除外): {filtered_out}")
+
+        if not filtered:
+            print("[DEBUG] No matches from Vision API. Falling back to multimodal LLM...")
+            llm_candidates = identify_zzz_objects_via_llm(content)
+            print(f"[DEBUG] LLM Candidates: {llm_candidates}")
+            for candidate in llm_candidates:
+                if fuzzy_match_filter(candidate):
+                    if candidate not in filtered:
+                        filtered.append(candidate)
+                else:
+                    if candidate not in filtered_out:
+                        filtered_out.append(candidate)
+            candidates = list(dict.fromkeys(candidates + llm_candidates))
+            print(f"[DEBUG] Filtered IN after LLM (検索対象): {filtered}")
+            print(f"[DEBUG] Filtered OUT after LLM (除外): {filtered_out}")
 
         return jsonify({
             "filtered_in": filtered,

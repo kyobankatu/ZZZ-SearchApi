@@ -1,0 +1,10 @@
+.venv/
+.git/
+.github/
+__pycache__/
+*.pyc
+*.pyo
+temp_glossary.csv
+README.md
+CLAUDE.md
+filtering.py

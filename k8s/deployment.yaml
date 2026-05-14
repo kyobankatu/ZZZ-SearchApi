@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zzz-search-api
+  namespace: zzz-search-api
+  labels:
+    app.kubernetes.io/name: zzz-search-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zzz-search-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: zzz-search-api
+    spec:
+      containers:
+        - name: api
+          image: zzz-search-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: zzz-search-api-secrets
+                  key: OPENROUTER_API_KEY
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /var/secrets/google/application_default_credentials.json
+          volumeMounts:
+            - name: config
+              mountPath: /app/data.yml
+              subPath: data.yml
+              readOnly: true
+            - name: google-application-credentials
+              mountPath: /var/secrets/google
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: zzz-search-api-config
+        - name: google-application-credentials
+          secret:
+            secretName: zzz-search-api-gcp-adc
+            optional: true

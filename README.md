@@ -79,10 +79,109 @@
 
     > **前提**: `gcloud auth application-default login` を事前に実行してADCを生成しておく必要があります。
 
+## k3s へのデプロイ
+
+`k8s/` 配下に k3s 向けの Kubernetes マニフェストを用意しています。
+
+### 1. イメージをビルドして k3s に取り込む
+
+ローカルの Docker でビルドしたイメージは、そのままでは k3s の containerd から見えないため、tar 経由で取り込みます。
+
+```bash
+docker build -t zzz-search-api:latest .
+docker save zzz-search-api:latest -o /tmp/zzz-search-api.tar
+sudo k3s ctr images import /tmp/zzz-search-api.tar
+```
+
+### 2. Secret を作成する
+
+OpenRouter API キーを Kubernetes Secret として作成します。
+
+```bash
+kubectl create namespace zzz-search-api --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n zzz-search-api create secret generic zzz-search-api-secrets \
+  --from-literal=OPENROUTER_API_KEY="your_openrouter_api_key" \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+GCS/Translation API を使う場合は、Google Cloud の Application Default Credentials も Secret として作成します。ADC ファイルがない場合、この手順はスキップできますが、用語集ロードや翻訳などの GCP 連携機能は失敗またはスキップされます。
+
+```bash
+kubectl -n zzz-search-api create secret generic zzz-search-api-gcp-adc \
+  --from-file=application_default_credentials.json="$HOME/.config/gcloud/application_default_credentials.json" \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+ADC ファイルを作る場合は、事前に次を実行してください。
+
+```bash
+gcloud auth application-default login
+```
+
+### 3. マニフェストを適用する
+
+```bash
+kubectl apply -k k8s/
+kubectl -n zzz-search-api rollout status deployment/zzz-search-api
+```
+
+### 4. 動作確認
+
+ポートフォワードで確認できます。
+
+```bash
+kubectl -n zzz-search-api port-forward service/zzz-search-api 8080:80
+curl http://127.0.0.1:8080/healthz
+```
+
+API 呼び出し例:
+
+```bash
+curl -X POST http://127.0.0.1:8080/get_info \
+  -H "Content-Type: application/json" \
+  -d '{"word":"アンビー"}'
+```
+
+Ingress を使う場合は、`k8s/ingress.yaml` の `zzz-search-api.example.com` を利用したいホスト名に変更してください。k3s 標準の Traefik を前提にしています。
+
+Cloudflare DNS には次のレコードを追加してください。
+
+```text
+Type: A
+Name: zzz-search-api
+IPv4 address: <traefik-load-balancer-ip>
+Proxy status: Proxied
+```
+
+この方式では Cloudflare Tunnel は不要です。Cloudflare から k3s の Traefik LoadBalancer に入り、Traefik が Host ヘッダーで API Service にルーティングします。
+
+Cloudflare Tunnel の「Add published application」で公開する場合、ホスト上で動いている cloudflared から Traefik に転送する構成なら次で設定できます。
+
+```text
+Subdomain: zzz-search-api
+Domain: <your-domain>
+Service URL: http://localhost:80
+```
+
+この場合も Kubernetes 側の Ingress host は `zzz-search-api.<your-domain>` である必要があります。
+
+### 更新手順
+
+コード変更後は、イメージを再ビルドして k3s に取り込み、Deployment を再起動します。
+
+```bash
+docker build -t zzz-search-api:latest .
+docker save zzz-search-api:latest -o /tmp/zzz-search-api.tar
+sudo k3s ctr images import /tmp/zzz-search-api.tar
+kubectl -n zzz-search-api rollout restart deployment/zzz-search-api
+kubectl -n zzz-search-api rollout status deployment/zzz-search-api
+```
+
 ## ファイル構成
 
 *   `main.py`: APIサーバーのメインロジック。Flaskアプリケーション。
 *   `data.yml`: プロジェクト設定（GCPプロジェクトID、バケットURI、使用モデル等）。
+*   `k8s/`: k3s/Kubernetes デプロイ用マニフェスト。
 *   `Dockerfile`: コンテナ化のための定義ファイル。
 *   `requirements.txt`: Python依存パッケージリスト。
 

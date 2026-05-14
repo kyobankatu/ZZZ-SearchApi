@@ -1,0 +1,18 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: zzz-search-api
+  namespace: zzz-search-api
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: zzz-search-api.katumon.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: zzz-search-api
+                port:
+                  name: http

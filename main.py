@@ -77,6 +77,11 @@ except Exception as e:
 app = Flask(__name__)
 CORS(app)
 
+
+@app.get("/healthz")
+def healthz():
+    return jsonify({"status": "ok"})
+
 # --- 用語集 (起動時にGCSからロード) ---
 local_glossary = {}           # EN -> JA (要約内の固有名詞翻訳用)
 local_glossary_ja_to_en = {}  # JA -> EN (検索ワード変換用)

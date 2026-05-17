@@ -6,7 +6,7 @@ metadata:
 spec:
   ingressClassName: traefik
   rules:
-    - host: zzz-search-api.katumon.com
+    - host: zzz-search-api.example.com
       http:
         paths:
           - path: /
